@@ -68,8 +68,8 @@ class PathPlanner(ABC):
         trans, quat = gu.transform_pos_quat_by_trans_quat(_pos, _quat, robot_trans, robot_quat)
 
         if self._solver.n_envs > 0:
-            self._solver.set_base_links_pos(trans, obj_link_idx, envs_idx=envs_idx)
-            self._solver.set_base_links_quat(quat, obj_link_idx, envs_idx=envs_idx)
+            self._solver.set_base_links_pos(trans[:, 0], obj_link_idx, envs_idx=envs_idx)
+            self._solver.set_base_links_quat(quat[:, 0], obj_link_idx, envs_idx=envs_idx)
         else:
             self._solver.set_base_links_pos(trans, obj_link_idx)
             self._solver.set_base_links_quat(quat, obj_link_idx)
@@ -601,6 +601,8 @@ class RRT(PathPlanner):
 
         if is_invalid.all():
             self._entity.set_qpos(qpos_cur, envs_idx=envs_idx if self._solver.n_envs else None, zero_velocity=False)
+            if is_plan_with_obj:
+                self.update_object(ee_link_idx, obj_link_idx, _pos, _quat, envs_idx)
             sol = torch.zeros((num_waypoints, len(envs_idx), sol.shape[-1]), dtype=gs.tc_float, device=gs.device)
             return sol, is_invalid
 
@@ -1000,6 +1002,8 @@ class RRTConnect(PathPlanner):
 
         if is_invalid.all():
             self._entity.set_qpos(qpos_cur, envs_idx=envs_idx if self._solver.n_envs else None, zero_velocity=False)
+            if is_plan_with_obj:
+                self.update_object(ee_link_idx, obj_link_idx, _pos, _quat, envs_idx)
             sol = torch.zeros((num_waypoints, len(envs_idx), sol.shape[-1]), dtype=gs.tc_float, device=gs.device)
             return sol, is_invalid
 

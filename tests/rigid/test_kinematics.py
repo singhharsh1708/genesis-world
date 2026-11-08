@@ -663,6 +663,21 @@ def test_path_planning_avoidance(backend, n_envs, batch_dofs_info, show_viewer, 
         ),
         vis_mode="collision",
     )
+    wall = scene.add_entity(
+        gs.morphs.Box(
+            size=(1.0, 1.0, 1.0),
+            pos=(0.0, -2.0, 0.5),
+            fixed=True,
+        ),
+        vis_mode="collision",
+    )
+    held_cube = scene.add_entity(
+        gs.morphs.Box(
+            size=(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
+            pos=(0.0, 2.0, 0.5),
+        ),
+        vis_mode="collision",
+    )
     scene.build(n_envs=n_envs)
     collider_state = scene.rigid_solver.collider.collider_state
 
@@ -770,6 +785,20 @@ def test_path_planning_avoidance(backend, n_envs, batch_dofs_info, show_viewer, 
         return_valid_mask=True,
     )
     assert not beyond_valid_mask.any()
+
+    # A held entity stuck in the wall makes every move collide, and is put back where it was once planning gives up.
+    held_cube.set_pos(wall.get_pos())
+    _, held_valid_mask = franka.plan_path(
+        qpos_goal=qpos_goal_within,
+        max_nodes=20,
+        max_retry=0,
+        return_valid_mask=True,
+        ee_link_name="hand",
+        with_entity=held_cube,
+    )
+    assert not held_valid_mask.any()
+    assert_allclose(held_cube.get_pos(), wall.get_pos(), tol=tol)
+    assert_allclose(gu.quat_to_xyz(held_cube.get_quat()), 0.0, tol=tol)
 
 
 @pytest.mark.required
