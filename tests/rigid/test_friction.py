@@ -426,6 +426,19 @@ def test_static_hold_unaffected_by_press_on_separate_body(show_viewer):
     assert_allclose(geom.get_friction(), scene.rigid_solver.get_geoms_friction(geom.idx), tol=gs.EPS)
     assert_allclose(geom.get_friction(), 0.37, tol=gs.EPS)
     assert_allclose(geom.get_friction_rolling(), 0.02, tol=gs.EPS)
+
+    # A coefficient takes the value a tensor holds, at every level, while a tensor torch tracks is refused, the
+    # rollout reading the model without differentiating it.
+    geom.set_friction(torch.tensor(0.37, dtype=gs.tc_float, device=gs.device))
+    presser.links[0].set_friction_torsional(torch.tensor(0.02, dtype=gs.tc_float, device=gs.device))
+    presser.set_friction_rolling(torch.tensor(0.02, dtype=gs.tc_float, device=gs.device))
+    assert_allclose(geom.get_friction(), 0.37, tol=gs.EPS)
+    assert_allclose(geom.get_friction_torsional(), 0.02, tol=gs.EPS)
+    assert_allclose(geom.get_friction_rolling(), 0.02, tol=gs.EPS)
+    with pytest.raises(gs.GenesisException):
+        geom.set_friction(torch.tensor(0.37, requires_grad=True))
+    with pytest.raises(gs.GenesisException):
+        presser.set_friction(torch.tensor(0.37, requires_grad=True))
     assert_allclose(geom.desc.friction, FRICTION, tol=gs.EPS)
     assert_allclose(geom.get_sol_params(), scene.rigid_solver.get_sol_params(geoms_idx=geom.idx)[0], tol=gs.EPS)
 

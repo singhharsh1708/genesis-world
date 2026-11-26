@@ -982,6 +982,16 @@ def test_inertial_property_setters(sliding_ball_pair, xml_path, implicit_inertia
     het_obj.set_mass(1.0)
     assert_allclose(het_obj.get_mass(), 1.0, tol=tol)
 
+    # A model parameter takes the value a tensor holds, while a tensor torch tracks is refused, the rollout reading
+    # the model without differentiating it.
+    het_obj.set_mass(torch.tensor(1.5, dtype=gs.tc_float, device=gs.device))
+    assert_allclose(het_obj.get_mass(), 1.5, tol=tol)
+    with pytest.raises(gs.GenesisException):
+        het_obj.set_mass(torch.tensor(1.5, requires_grad=True))
+    with pytest.raises(gs.GenesisException):
+        het_link.set_mass(torch.tensor(0.5, requires_grad=True))
+    het_obj.set_mass(1.0)
+
     # One route brings a single link to the mass, keeping the inertia it was given, and the other the whole body by a
     # ratio, which scales the inertia with it - so the link route writes the heavier inertia itself to match.
     mass_ratio = 2.0 / per_link.get_links_mass(1)

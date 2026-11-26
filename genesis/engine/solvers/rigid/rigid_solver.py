@@ -194,6 +194,16 @@ MASS_MAT_UPDATED = int(FORWARD_STATUS.MASS_MAT_UPDATED)
 MASS_MAT_L_UPDATED = int(FORWARD_STATUS.MASS_MAT_L_UPDATED)
 
 
+def _refuse_tracked_model_value(value, name: str) -> None:
+    """Refuse a value torch tracks for the model parameter 'name'.
+
+    The rollout reads the model without differentiating it, so a tracked value would be written and its gradient left
+    behind. The refusal stands down under 'torch.no_grad', where the caller asks for no gradient to begin with.
+    """
+    if isinstance(value, torch.Tensor) and value.requires_grad and torch.is_grad_enabled():
+        gs.raise_exception(f"'{name}' is a parameter of the model, which carries no gradient.")
+
+
 def _sanitize_sol_params(
     sol_params, min_timeconst: float, default_timeconst: float | None = None, *, floor_timeconst: bool = True
 ):
@@ -2111,6 +2121,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         """
         if not self._options.batch_links_info and envs_idx is not None:
             gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
+        _refuse_tracked_model_value(values, name)
         shape = {"mass": (), "COM": (3,), "inertia": (3, 3)}[name]
         # A value of fewer dimensions than the property holds would be spread over it, which for an inertia means a
         # tensor of one number repeated: no inertia of any body.
@@ -3167,15 +3178,18 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     @mutates
     def set_geom_friction(self, friction, geoms_idx):
-        kernel_set_geom_friction(geoms_idx, friction, self.dyn_info)
+        _refuse_tracked_model_value(friction, "friction")
+        kernel_set_geom_friction(geoms_idx, float(friction), self.dyn_info)
 
     @mutates
     def set_geom_friction_torsional(self, friction_torsional, geoms_idx):
-        kernel_set_geom_friction_torsional(geoms_idx, friction_torsional, self.dyn_info)
+        _refuse_tracked_model_value(friction_torsional, "friction_torsional")
+        kernel_set_geom_friction_torsional(geoms_idx, float(friction_torsional), self.dyn_info)
 
     @mutates
     def set_geom_friction_rolling(self, friction_rolling, geoms_idx):
-        kernel_set_geom_friction_rolling(geoms_idx, friction_rolling, self.dyn_info)
+        _refuse_tracked_model_value(friction_rolling, "friction_rolling")
+        kernel_set_geom_friction_rolling(geoms_idx, float(friction_rolling), self.dyn_info)
 
     @mutates
     def set_geoms_friction(self, friction, geoms_idx=None):
