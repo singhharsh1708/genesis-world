@@ -42,7 +42,9 @@ def test_grid_sensor_contact_and_reset(show_viewer, tol, n_envs):
     sensor = scene.add_sensor(
         gs.sensors.TemperatureGrid(
             ambient_temperature=BASE_TEMP,
-            convection_coefficient=0.0,
+            # The grid returns to the ambient through the area it exposes, which radiation alone is far too slow to
+            # do within the steps below, so it is convection that carries it here.
+            convection_coefficient=200.0,
             simulate_all_link_temperatures=False,
             draw_debug=True,
             entity_idx=platform.idx,
@@ -116,6 +118,79 @@ def test_grid_sensor_contact_and_reset(show_viewer, tol, n_envs):
         scene.step()
     data = sensor.read()
     assert_allclose(data, BASE_TEMP, tol=5e-2)
+
+
+@pytest.mark.required
+def test_grid_cools_at_the_lumped_rate(show_viewer, tol):
+    SIZE = (0.04, 0.02, 0.01)
+    BASE_TEMP = 80.0
+    AMBIENT_TEMP = 21.0
+    DENSITY = 2700.0
+    SPECIFIC_HEAT = 900.0
+    EMISSIVITY = 0.9
+    CONVECTION = 1.0
+    STEFAN_BOLTZMANN = 5.670374419e-8
+    KELVIN_OFFSET = 273.15
+    DT = 0.01
+    STEPS = 20
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.6, -0.6, 0.9),
+            camera_lookat=(0.1, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    properties = gs.sensors.TemperatureProperties(
+        base_temperature=BASE_TEMP,
+        density=DENSITY,
+        specific_heat=SPECIFIC_HEAT,
+        emissivity=EMISSIVITY,
+    )
+    sensors = []
+    for x, yaw in ((0.0, 0.0), (0.2, 90.0)):
+        box = scene.add_entity(
+            morph=gs.morphs.Box(
+                size=SIZE,
+                pos=(x, 0.0, 0.5),
+                euler=(0.0, 0.0, yaw),
+            ),
+        )
+        sensors.append(
+            scene.add_sensor(
+                gs.sensors.TemperatureGrid(
+                    entity_idx=box.idx,
+                    grid_size=(1, 1, 1),
+                    properties_dict={-1: properties},
+                    ambient_temperature=AMBIENT_TEMP,
+                    convection_coefficient=CONVECTION,
+                )
+            )
+        )
+    scene.build(n_envs=2)
+
+    for _ in range(STEPS):
+        scene.step()
+
+    # One voxel holding the whole box cools at the lumped rate, the flux it radiates and convects weighed by the area
+    # it exposes, over its heat capacity. The temperature barely moves over these steps, so the flux of the first one
+    # carries the whole drop.
+    a, b, c = SIZE
+    area = 2.0 * (a * b + b * c + c * a)
+    volume = a * b * c
+    flux_radiated = (
+        EMISSIVITY * STEFAN_BOLTZMANN * ((BASE_TEMP + KELVIN_OFFSET) ** 4 - (AMBIENT_TEMP + KELVIN_OFFSET) ** 4)
+    )
+    flux_convected = CONVECTION * (BASE_TEMP - AMBIENT_TEMP)
+    temperature = BASE_TEMP - STEPS * DT * (flux_radiated + flux_convected) * area / (DENSITY * SPECIFIC_HEAT * volume)
+    for sensor in sensors:
+        assert_allclose(sensor.read_ground_truth().reshape(-1), temperature, atol=1e-4)
+
+    # The grid sits in the frame of its link, so turning the link about its own axis leaves every reading alone.
+    assert_allclose(sensors[0].read_ground_truth(), sensors[1].read_ground_truth(), tol=tol)
 
 
 @pytest.mark.parametrize("n_envs", [0, pytest.param(2, marks=pytest.mark.required)])

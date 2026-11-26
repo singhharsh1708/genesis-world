@@ -73,12 +73,21 @@ def _compute_K2_rfft3(
     return K2.to(device=device)
 
 
-def _compute_surface_mask(nx: int, ny: int, nz: int, device: torch.device) -> torch.Tensor:
-    """Boolean mask of boundary voxels (at least one face on grid boundary). Shape (nx, ny, nz)."""
+def _compute_surface_area(
+    nx: int, ny: int, nz: int, voxel_size: torch.Tensor, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Area each voxel exposes to the ambient, through its faces on the boundary of the grid. Shape (nx, ny, nz).
+
+    The areas of a grid sum to the area of the box it fills, whatever the number of voxels it holds.
+    """
     ix, iy, iz = torch.meshgrid(
         torch.arange(nx, device=device), torch.arange(ny, device=device), torch.arange(nz, device=device), indexing="ij"
     )
-    return (ix == 0) | (ix == nx - 1) | (iy == 0) | (iy == ny - 1) | (iz == 0) | (iz == nz - 1)
+    dx, dy, dz = voxel_size.tolist()
+    faces_x = ((ix == 0).to(dtype) + (ix == nx - 1).to(dtype)) * (dy * dz)
+    faces_y = ((iy == 0).to(dtype) + (iy == ny - 1).to(dtype)) * (dx * dz)
+    faces_z = ((iz == 0).to(dtype) + (iz == nz - 1).to(dtype)) * (dx * dy)
+    return faces_x + faces_y + faces_z
 
 
 def _apply_diffusion_and_heat_generation(
@@ -400,7 +409,10 @@ def _radiation_convection_delta_T(
     rho_cp_vol: torch.Tensor | float,
     dt: float,
 ) -> torch.Tensor:
-    """Temperature change (to subtract) from radiation + convection: -dt * (q_rad + q_conv) / (rho_cp * vol)."""
+    """Temperature change (to subtract) per unit of exposed area, dt * (q_rad + q_conv) / (rho_cp * vol).
+
+    The caller multiplies it by the area through which what it cools reaches the ambient.
+    """
     T_K = T + KELVIN_OFFSET
     T_amb_K = ambient_temp + KELVIN_OFFSET
     q_rad = emissivity * STEFAN_BOLTZMANN * (T_K**4 - T_amb_K**4)
@@ -410,11 +422,12 @@ def _radiation_convection_delta_T(
 
 def _apply_radiation_convection(
     cache_sizes: list[int],
-    sensor_surface_mask: list[torch.Tensor],
+    sensor_surface_area: list[torch.Tensor],
     voxel_volume: torch.Tensor,
     links_idx: torch.Tensor,
     link_temps: torch.Tensor,
     link_volume: torch.Tensor,
+    link_surface_area: torch.Tensor,
     link_to_material_idx: torch.Tensor,
     link_emissivity: torch.Tensor,
     link_rho_cp: torch.Tensor,
@@ -430,7 +443,7 @@ def _apply_radiation_convection(
     start = 0
     for i_s in range(len(cache_sizes)):
         size = cache_sizes[i_s]
-        mask = sensor_surface_mask[i_s].reshape(-1)
+        area = sensor_surface_area[i_s].reshape(-1)
         vol = max(voxel_volume[i_s].item(), gs.EPS)
         mat_idx = link_to_material_idx[links_idx[i_s]]
         emiss = link_emissivity[mat_idx].item()
@@ -438,7 +451,7 @@ def _apply_radiation_convection(
         denom = rcp * vol
         T_flat = output[start : start + size]
         delta = _radiation_convection_delta_T(T_flat, emiss, convection_coeff, ambient_temp, denom, dt)
-        output[start : start + size] -= delta * mask.unsqueeze(-1)
+        output[start : start + size] -= delta * area.unsqueeze(-1)
         start += size
 
     if link_temps.numel() > 0:
@@ -448,7 +461,7 @@ def _apply_radiation_convection(
         delta = _radiation_convection_delta_T(
             link_temps, link_emissivity[mat_idx], convection_coeff, ambient_temp, rcp_vol.unsqueeze(0), dt
         )
-        link_temps.sub_(delta * valid.unsqueeze(0).to(gs.tc_float))
+        link_temps.sub_(delta * link_surface_area.unsqueeze(0) * valid.unsqueeze(0).to(gs.tc_float))
 
 
 def _apply_T_measured_filter(
@@ -488,6 +501,7 @@ class TemperatureGridSensorMetadata(TrackableMixin, RigidSensorMetadataMixin, Si
     simulate_all_link_temps: bool = False
     link_temps: torch.Tensor = make_tensor_field((0, 0))
     link_volume: torch.Tensor = make_tensor_field((0,))
+    link_surface_area: torch.Tensor = make_tensor_field((0,))
 
     aabb_min: torch.Tensor = make_tensor_field((0, 3))
     aabb_extent: torch.Tensor = make_tensor_field((0, 3))
@@ -497,7 +511,7 @@ class TemperatureGridSensorMetadata(TrackableMixin, RigidSensorMetadataMixin, Si
     sensor_time_const: torch.Tensor = make_tensor_field((0,))
     contact_depth_weight: torch.Tensor = make_tensor_field((0,))
     K2_spectral: list[torch.Tensor] = field(default_factory=list)
-    sensor_surface_mask: list[torch.Tensor] = field(default_factory=list)
+    sensor_surface_area: list[torch.Tensor] = field(default_factory=list)
     heat_generation: list[torch.Tensor | None] = field(default_factory=list)
     contact_area_scratch: torch.Tensor = make_tensor_field((0, len(_ScratchIdx)))
     contact_area_buffer: torch.Tensor = make_tensor_field((0, 0))
@@ -568,8 +582,12 @@ class TemperatureGridSensor(
                     (solver.n_envs_, solver.n_links), dtype=gs.tc_float, device=gs.device
                 )
                 self._shared_metadata.link_volume = torch.empty(solver.n_links, dtype=gs.tc_float, device=gs.device)
+                self._shared_metadata.link_surface_area = torch.zeros(
+                    solver.n_links, dtype=gs.tc_float, device=gs.device
+                )
 
                 link_volume = self._shared_metadata.link_volume
+                link_surface_area = self._shared_metadata.link_surface_area
                 for entity in solver._entities:
                     for link in entity.links:
                         li = link.idx
@@ -577,8 +595,11 @@ class TemperatureGridSensor(
                             aabb = link.get_AABB()
                             if aabb.ndim == 3:
                                 aabb = aabb[0]
-                            vol = (aabb[1] - aabb[0]).prod().clamp(min=gs.EPS)
+                            extent = aabb[1] - aabb[0]
+                            vol = extent.prod().clamp(min=gs.EPS)
                             link_volume[li] = vol
+                            ab, bc, ca = extent[0] * extent[1], extent[1] * extent[2], extent[2] * extent[0]
+                            link_surface_area[li] = 2.0 * (ab + bc + ca)
                 ambient_T = self._shared_metadata.ambient_temperature
                 link_base_T = self._shared_metadata.link_material_properties[_PropIdx.BASE_TEMP]
                 link_to_mat = self._shared_metadata.link_to_material_idx
@@ -592,16 +613,17 @@ class TemperatureGridSensor(
 
         # Per-sensor properties
         assert self._link is not None
-        aabb_world = self._link.get_AABB()
-        if aabb_world.ndim == 2:
-            aabb_world = aabb_world.unsqueeze(0)  # (1, 2, 3)
-        aabb_min_w = aabb_world[0, 0]  # (3,)
-        aabb_max_w = aabb_world[0, 1]  # (3,)
+        # The grid is laid out in the frame of the link, which the contact kernel and the debug cells read it in, so
+        # its bounds come from the vertices of the geoms read in that frame. The corners of the box the world holds
+        # the link in sit elsewhere once the link is rotated. The geoms state them one by one, a heterogeneous entity
+        # answering for its link as a whole.
+        verts_world = torch.cat([geom.get_verts().reshape(-1, 3) for geom in self._link.geoms])
         link_pos, link_quat = self._link.get_pos(relative=False), self._link.get_quat(relative=False)
         if link_pos.ndim == 2:
             link_pos, link_quat = link_pos[0], link_quat[0]
-        aabb_min_local = gu.inv_transform_by_trans_quat(aabb_min_w, link_pos, link_quat)
-        aabb_max_local = gu.inv_transform_by_trans_quat(aabb_max_w, link_pos, link_quat)
+        verts_local = gu.inv_transform_by_trans_quat(verts_world, link_pos, link_quat)
+        aabb_min_local = verts_local.amin(dim=0)
+        aabb_max_local = verts_local.amax(dim=0)
         aabb_extent = (aabb_max_local - aabb_min_local).reshape(3)
         self._shared_metadata.aabb_min = concat_with_tensor(
             self._shared_metadata.aabb_min, aabb_min_local, expand=(1, 3), dim=0
@@ -633,8 +655,8 @@ class TemperatureGridSensor(
         K2_padded = _compute_K2_rfft3(nx * 2, ny * 2, nz * 2, dx, dy, dz, gs.device, gs.tc_float, gs.EPS)
         self._shared_metadata.K2_spectral.append(K2_padded)
 
-        surface_mask = _compute_surface_mask(nx, ny, nz, gs.device).to(gs.tc_float)
-        self._shared_metadata.sensor_surface_mask.append(surface_mask)
+        surface_area = _compute_surface_area(nx, ny, nz, voxel_size, gs.device, gs.tc_float)
+        self._shared_metadata.sensor_surface_area.append(surface_area)
 
         if self._options.heat_generation is not None:
             q = torch.tensor(self._options.heat_generation, dtype=gs.tc_float, device=gs.device)
@@ -750,11 +772,12 @@ class TemperatureGridSensor(
         # 4) Radiation and convection
         _apply_radiation_convection(
             shared_metadata.cache_sizes,
-            shared_metadata.sensor_surface_mask,
+            shared_metadata.sensor_surface_area,
             shared_metadata.voxel_volume,
             shared_metadata.links_idx,
             shared_metadata.link_temps,
             shared_metadata.link_volume,
+            shared_metadata.link_surface_area,
             shared_metadata.link_to_material_idx,
             link_emissivity,
             link_rho_cp,
